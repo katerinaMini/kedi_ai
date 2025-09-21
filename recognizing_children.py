@@ -1,14 +1,14 @@
 import time
 import cv2
 import numpy as np
-import requests
 import faiss
 import threading
 import json
+import os
 from pathlib import Path
 from collections import deque
 from insightface.app import FaceAnalysis
-from typing import Optional, List
+from typing import Optional
 
 # --------- НАСТРОЙКИ ---------
 VIDEO_SOURCE = "video/20250904115729234.mp4"
@@ -32,10 +32,6 @@ SIMILARITY_THRESHOLD = 0.3
 MIN_FACE_PIXELS = 10
 MAX_MISSED_FRAMES = 10
 IOU_THRESHOLD = 0.1
-
-# telegram
-TELEGRAM_BOT_TOKEN = '8052220400:AAEqtT1ISu2zWL2LNvtdI3GyP2YFQrHQlMk'
-CHAT_ID = '1439024241'
 
 # recognition thresholds
 RECOGNITION_CONFIDENCE_FRONTAL = 0.40
@@ -66,6 +62,9 @@ PRIORITIES = {
 }
 
 DEBUG = True  # включи DEBUG для логов
+
+# where to save snapshots instead of sending telegram
+SNAPSHOT_DIR = Path("snapshots")
 
 # notified DB (per-day)
 NOTIFIED_DB_PATH = Path('notified_db.json')
@@ -106,41 +105,6 @@ def save_notified_db():
     except Exception as e:
         print(f"[!] Ошибка сохранения notified_db: {e}")
 
-def send_telegram_photo_sync(image_np: np.ndarray, caption: str = ''):
-    ts = _current_timestamp()
-    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto'
-    try:
-        ok, buf = cv2.imencode('.jpg', image_np)
-        if not ok:
-            print('[!] Ошибка кодирования изображения для Telegram.')
-            return
-        img_bytes = buf.tobytes()
-        files = {'photo': ('face.jpg', img_bytes, 'image/jpeg')}
-        data = {'chat_id': CHAT_ID, 'caption': f'[{ts}] {caption}'}
-        r = requests.post(url, data=data, files=files, timeout=10)
-        if r.status_code != 200:
-            print(f'[!] Ошибка отправки фото в Telegram: {r.status_code} {r.text}')
-    except Exception as e:
-        print(f'[!] Ошибка отправки фото в Telegram: {e}')
-
-def send_telegram_photo(image_np: np.ndarray, caption: str = ''):
-    threading.Thread(target=send_telegram_photo_sync, args=(image_np, caption), daemon=True).start()
-
-def send_telegram_message_sync(message: str):
-    ts = _current_timestamp()
-    text = f"[{ts}] {message}"
-    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
-    data = {'chat_id': CHAT_ID, 'text': text}
-    try:
-        r = requests.post(url, data=data, timeout=5)
-        if r.status_code != 200:
-            print(f'[!] Ошибка Telegram: {r.status_code} {r.text}')
-    except Exception as e:
-        print(f'[!] Ошибка отправки в Telegram: {e}')
-
-def send_telegram_message(message: str):
-    threading.Thread(target=send_telegram_message_sync, args=(message,), daemon=True).start()
-
 def normalize_vec(v: np.ndarray) -> np.ndarray:
     v = np.array(v, dtype=np.float32)
     norm = np.linalg.norm(v)
@@ -171,7 +135,7 @@ def clamp_bbox_xyxy(bbox, w, h):
     if y2 <= y1: y2 = min(h - 1, y1 + 1)
     return x1, y1, x2, y2
 
-# --- keypoints/pose/hair helpers (kept compact but robust) ---
+# --- keypoints/pose/hair helpers ---
 def extract_keypoints_from_face(face):
     candidates = ['kps','keypoints','landmark_2d_106','landmark','landmarks']
     for name in candidates:
@@ -423,7 +387,7 @@ class TrackedPerson:
         except Exception:
             return False
 
-# ----------------- FaceDatabase (unchanged logic) -----------------
+# ----------------- FaceDatabase -----------------
 class FaceDatabase:
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -691,7 +655,7 @@ class FaceDatabase:
 
         return 'Unknown', float(best_combined if best_combined >= 0 else 0.0), (str(best_raw_label) if best_raw_label is not None else None), (int(best_i) if best_i >= 0 else -1), float(best_face_sim)
 
-# ----------------- recognition helpers (simple/robust) ----------------
+# ----------------- recognition helpers ----------------
 def should_recognize(person: TrackedPerson, frame_idx: int) -> bool:
     try:
         if getattr(person, 'bbox', None) is None:
@@ -810,10 +774,10 @@ def try_recognize_person(person: TrackedPerson, db: FaceDatabase, frame_idx:int,
             person.label = label; person.similarity = combined_sim; person.recognized = True
             person.last_recognition_frame = frame_idx
             person.unrecognized_frames = 0
-            # send snapshot once
+            # save snapshot once to disk
             send_snapshot_if_recognized(person, frame, frame.shape[1], frame.shape[0], frame_idx)
     else:
-        # hystersis logic: if previously recognized, keep label for a while
+        # hystersis logic
         if getattr(person,'recognized', False) or getattr(person,'fixed_label', None) is not None:
             person.unrecognized_frames = person.unrecognized_frames + 1 if getattr(person,'unrecognized_frames',None) is not None else 1
             if getattr(person,'initial_embedding',None) is not None and person.embedding is not None:
@@ -835,7 +799,51 @@ def try_recognize_person(person: TrackedPerson, db: FaceDatabase, frame_idx:int,
                 person.label = 'Unknown'; person.recognized = False; person.similarity = 0.0
                 person.initial_embedding = None; person.fixed_label = None
 
+# ----------------- snapshot saving (замена telegram) -----------------
+def save_snapshot_to_folder(image_np: np.ndarray, label: str, sim: float, track_id: int, frame_idx: int, out_dir: Path = SNAPSHOT_DIR):
+    """
+    Сохраняет crop в папку out_dir; возвращает путь к файлу или None.
+    Также создаёт рядом JSON с метаданными.
+    """
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.localtime()
+        ts_str = time.strftime("%Y%m%d_%H%M%S", ts)
+        # make safe label
+        safe_label = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(label))
+        filename_base = f"{ts_str}_frame{frame_idx}_trk{track_id}_{safe_label}_sim{sim:.2f}"
+        img_path = out_dir / (filename_base + ".jpg")
+        meta_path = out_dir / (filename_base + ".json")
+        # write image (try highest jpeg quality)
+        ok = cv2.imwrite(str(img_path), image_np, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            print(f"[!] Не удалось сохранить изображение {img_path}")
+            return None
+        meta = {
+            "timestamp": _current_timestamp(),
+            "ts_epoch": time.time(),
+            "frame": int(frame_idx),
+            "track_id": int(track_id),
+            "label": str(label),
+            "similarity": float(sim),
+            "image": str(img_path.name)
+        }
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[!] Ошибка записи мета-файла {meta_path}: {e}")
+        if DEBUG:
+            print(f"[DEBUG] Saved snapshot {img_path}")
+        return img_path
+    except Exception as e:
+        print(f"[!] save_snapshot_to_folder error: {e}")
+        return None
+
 def send_snapshot_if_recognized(person: TrackedPerson, frame, w, h, frame_idx: int, key_mode: str='label'):
+    """
+    Заменяет прежнюю отправку в телеграм — сохраняет кадр на диск (один раз по ключу session).
+    """
     try:
         if not person.recognized or person.snapshot_sent or person.label == 'Unknown':
             return
@@ -857,19 +865,19 @@ def send_snapshot_if_recognized(person: TrackedPerson, frame, w, h, frame_idx: i
                 SENT_SNAPSHOTS_SESSION.discard(key)
             return
         crop = frame[y1:y2, x1:x2]
-        caption = f"Распознан: {person.label} (sim={person.similarity:.2f}) track_id={person.track_id} frame={frame_idx}"
-        try:
-            send_telegram_photo(crop, caption=caption)
+        # save using single function
+        saved = save_snapshot_to_folder(crop, person.label, person.similarity, person.track_id, frame_idx, out_dir=SNAPSHOT_DIR)
+        if saved is not None:
             person.snapshot_sent = True
             if DEBUG:
-                print(f"[DEBUG] Sent snapshot for {person.label} track {person.track_id}")
-        except Exception:
+                print(f"[DEBUG] Snapshot saved for {person.label} track {person.track_id}")
+        else:
             with SENT_SNAPSHOTS_LOCK:
                 SENT_SNAPSHOTS_SESSION.discard(key)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[!] send_snapshot_if_recognized error: {e}")
 
-# ---------------- main loop (detection by detector_app every FRAME_SKIP frames, heavy-recognition every RECOG_INTERVAL_SEC) ----------------
+# ---------------- main loop ----------------
 def main():
     load_notified_db()
     print('Загрузка моделей InsightFace (detector и recognizer)...')
@@ -884,7 +892,10 @@ def main():
 
     db = FaceDatabase(DB_EMBED_DIR)
     if db.index is None:
-        send_telegram_message("⚠️ База данных лиц не загружена. Распознавание отключено.")
+        # вместо отправки telegram — логируем и сохраняем в notified_db
+        msg = "⚠️ База данных лиц не загружена. Распознавание отключено."
+        print(msg)
+        notified_db['db_missing'] = _current_timestamp()
 
     cap = cv2.VideoCapture(VIDEO_SOURCE)
     if not cap.isOpened():
@@ -894,7 +905,7 @@ def main():
     tracked_persons = {}  # track_id -> TrackedPerson
     frame_idx = 0
     last_recog_time = 0.0
-    force_heavy = False  # *** CHANGED *** flag to force heavy pass on next processed frame
+    force_heavy = False
 
     print('Начинаем обработку видео (без GUI). Нажмите Ctrl+C для остановки.')
 
@@ -909,30 +920,25 @@ def main():
             h, w = frame.shape[:2]
             now = time.time()
 
-            # Always predict on every frame so tracks move smoothly between processing frames
+            # predict on every frame so tracks move smoothly between processed frames
             for t in tracked_persons.values():
                 t.predict()
 
-            # *** CHANGED: evaluate heavy_pending on every frame (even skipped ones) ***
             heavy_pending = (now - last_recog_time) >= RECOG_INTERVAL_SEC
 
-            # If this frame is skipped, do not run detector logic — only housekeeping
+            # skip frames if configured
             if FRAME_SKIP > 1 and (frame_idx % FRAME_SKIP) != 0:
                 if heavy_pending:
-                    # we missed the interval on a skipped frame -> schedule heavy pass on next processed frame
-                    force_heavy = True  # will trigger heavy on next processed frame
+                    force_heavy = True
                     if DEBUG:
                         print(f"[DEBUG] Heavy interval expired on skipped frame {frame_idx}. Forcing heavy on next processed frame.")
-                    # NOTE: do not update last_recog_time here — update only when heavy actually runs
-                    # Continue to next frame but do not lose the pending heavy pass
                     continue
                 else:
-                    # housekeeping: remove expired tracks occasionally
                     if frame_idx % (FRAME_SKIP * 30) == 0 and DEBUG:
                         print(f"[DEBUG] Skipped frame {frame_idx}, active tracks: {len(tracked_persons)}")
                     continue
 
-            # 1) lightweight detection on (non-skipped) frame
+            # lightweight detection
             try:
                 det_faces = detector_app.get(frame)
             except Exception as e:
@@ -952,7 +958,7 @@ def main():
                 except Exception:
                     continue
 
-            # 2) associate detections with existing tracks via IoU
+            # associate to existing tracks by IoU
             unmatched = list(range(len(dets)))
             for tid, track in list(tracked_persons.items()):
                 best_match_idx = -1; best_iou = IOU_THRESHOLD
@@ -973,7 +979,7 @@ def main():
                     if best_match_idx in unmatched:
                         unmatched.remove(best_match_idx)
 
-            # 3) create new tracks for remaining dets
+            # create new tracks for remaining detections
             for i in list(unmatched):
                 try:
                     f = dets[i]['insight_obj']
@@ -987,10 +993,9 @@ def main():
                 except Exception:
                     continue
 
-            # 4) heavy recognition pass: run when either the interval is pending or we've been forced
-            do_heavy = heavy_pending or force_heavy  # *** CHANGED ***
+            # heavy recognition pass when pending or forced
+            do_heavy = heavy_pending or force_heavy
             if do_heavy:
-                # perform heavy; update last_recog_time only when heavy actually runs
                 if DEBUG:
                     print(f"[DEBUG] Heavy recognition pass at {time.strftime('%H:%M:%S')} frame={frame_idx} tracks={len(tracked_persons)} (force_heavy={force_heavy})")
                 try:
@@ -1000,7 +1005,7 @@ def main():
                         print(f"[DEBUG] recognizer_app.get error: {e}")
                     recog_faces = []
 
-                # parse recognition results
+                # parse recog results
                 rec_list = []
                 for rf in recog_faces:
                     try:
@@ -1033,7 +1038,7 @@ def main():
                     except Exception:
                         continue
 
-                # match rec_list to tracks by IoU
+                # match recognition to tracks
                 for rec in rec_list:
                     best_tid = None; best_iou = IOU_THRESHOLD
                     for tid, person in tracked_persons.items():
@@ -1061,7 +1066,7 @@ def main():
                             if DEBUG:
                                 print(f"[DEBUG] try_recognize_person error: {e}")
                     else:
-                        # create a new recognized track (optional)
+                        # create new recognized track (optional)
                         try:
                             new_id = next_track_id()
                             class SimpleFace2:
@@ -1087,11 +1092,11 @@ def main():
 
                 # heavy pass executed -> update last_recog_time and clear force flag
                 last_recog_time = time.time()
-                force_heavy = False  # *** CHANGED ***
+                force_heavy = False
                 if DEBUG:
                     print(f"[DEBUG] Heavy pass completed, last_recog_time updated to {time.strftime('%H:%M:%S', time.localtime(last_recog_time))}")
 
-            # 5) remove expired tracks
+            # remove expired tracks
             for tid in list(tracked_persons.keys()):
                 p = tracked_persons[tid]
                 if p.missed_frames >= MAX_MISSED_FRAMES:
@@ -1107,7 +1112,7 @@ def main():
                         print(f"[DEBUG] Removing expired track {tid}")
                     del tracked_persons[tid]
 
-            # 6) logging summary (no GUI)
+            # logging summary
             if frame_idx % 30 == 0 and DEBUG:
                 known = sum(1 for p in tracked_persons.values() if p.label != 'Unknown')
                 unknown = len(tracked_persons) - known
